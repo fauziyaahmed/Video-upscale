@@ -1,0 +1,6 @@
+{
+  "name": "UpscaleAI",
+  "description": "AI-powered video upscaling and quality enhancement studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

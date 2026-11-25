@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">UpscaleAI</string>
+    <string name="nav_studio">Studio</string>
+    <string name="nav_exports">Exports</string>
+    <string name="hero_title">4K AI Video Mastering</string>
+    <string name="hero_subtitle">Transform blurry, compressed clips into razor-sharp high-resolution video with real-time GPU enhancement.</string>
+    <string name="action_select_video">Select Video</string>
+    <string name="action_load_demo">Load 360p Demo Clip</string>
+    <string name="action_analyze_ai">Smart AI Analyze</string>
+    <string name="action_upscale_export">Upscale &amp; Export</string>
+    <string name="action_cancel_export">Cancel Export</string>
+    <string name="action_play_result">Play</string>
+    <string name="action_share">Share</string>
+    <string name="ai_notice_firebase_required">Cloud Gemini AI analysis requires Firebase. Showing on-device sample analysis &amp; heuristic tuning.</string>
+    <string name="label_before">ORIGINAL</string>
+    <string name="label_after">ENHANCED</string>
+    <string name="empty_exports_title">No Upscaled Videos Yet</string>
+    <string name="empty_exports_subtitle">Select a clip in Studio and export it in 1080p, 2K, or 4K to see your mastered videos here.</string>
+</resources>
