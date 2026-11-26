@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.Presentation
@@ -96,6 +97,7 @@ class VideoUpscaleExporter(private val context: Context) {
         val transformer = Transformer.Builder(context)
             .setVideoMimeType(params.codec.mimeType)
             .setEncoderFactory(encoderFactory)
+            .setMaxDelayBetweenMuxerSamplesMs(C.TIME_UNSET)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                     stopProgressPolling()

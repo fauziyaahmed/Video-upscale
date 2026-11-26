@@ -1,11 +1,13 @@
 package com.example.engine
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Shader
+import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -14,30 +16,36 @@ import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import kotlin.math.sin
 import kotlin.random.Random
 
 /**
- * Generates a short 360p compressed H.264 MP4 test clip locally via MediaCodec + MediaMuxer
- * so users on fresh devices or emulators without gallery videos can immediately preview and
- * export an upscaled video.
+ * Generates a short 360p compressed H.264 MP4 test clip locally via MediaCodec (YUV420Flexible)
+ * and MediaMuxer so users on fresh devices or emulators without gallery videos can immediately
+ * preview and export an upscaled video without Surface/EGL input dependencies.
  */
 object TestClipGenerator {
 
+    private const val DEMO_FILE_NAME = "demo_skyline_v2_360p.mp4"
+
     suspend fun getOrCreateDemoClip(context: Context): Uri = withContext(Dispatchers.IO) {
-        val outFile = File(context.cacheDir, "demo_skyline_360p.mp4")
-        if (outFile.exists() && outFile.length() > 16_000L) {
+        val outFile = File(context.cacheDir, DEMO_FILE_NAME)
+        if (outFile.exists() && outFile.length() > 24_000L) {
             return@withContext Uri.fromFile(outFile)
+        }
+        if (outFile.exists()) {
+            outFile.delete()
         }
 
         val width = 640
         val height = 360
         val fps = 24
-        val frameCount = 72 // 3 seconds
-        val bitrate = 450_000 // Intentionally low bitrate so upscaling & enhancement are clearly visible
+        val frameCount = 60 // 2.5 seconds
+        val bitrate = 480_000 // Intentionally modest bitrate so upscaling & enhancement are clearly visible
 
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
@@ -47,57 +55,113 @@ object TestClipGenerator {
         var muxer: MediaMuxer? = null
         var trackIndex = -1
         var muxerStarted = false
+        var samplesWritten = 0
+
+        val frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(frameBitmap)
+        val argbPixels = IntArray(width * height)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val rng = Random(42)
 
         try {
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val inputSurface = encoder.createInputSurface()
             encoder.start()
 
-            if (outFile.exists()) outFile.delete()
             muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-
             val bufferInfo = MediaCodec.BufferInfo()
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-            val rng = Random(42)
 
-            fun drainEncoder(endOfStream: Boolean) {
-                if (endOfStream) {
-                    encoder.signalEndOfInputStream()
+            var inputDone = false
+            var outputDone = false
+            var frameIndex = 0
+            val frameDurationUs = 1_000_000L / fps
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inIndex = encoder.dequeueInputBuffer(10_000L)
+                    if (inIndex >= 0) {
+                        if (frameIndex >= frameCount) {
+                            encoder.queueInputBuffer(
+                                inIndex,
+                                0,
+                                0,
+                                frameIndex * frameDurationUs,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inputDone = true
+                        } else {
+                            drawTestFrame(canvas, width, height, frameIndex, frameCount, paint, rng)
+                            frameBitmap.getPixels(argbPixels, 0, width, 0, 0, width, height)
+
+                            val image = try {
+                                encoder.getInputImage(inIndex)
+                            } catch (_: Exception) {
+                                null
+                            }
+
+                            val byteSize: Int
+                            if (image != null) {
+                                fillYuvImageFromArgb(image, argbPixels, width, height)
+                                byteSize = width * height * 3 / 2
+                            } else {
+                                val inBuffer = encoder.getInputBuffer(inIndex)
+                                    ?: throw IllegalStateException("Encoder input buffer unavailable")
+                                byteSize = fillI420BufferFromArgb(inBuffer, argbPixels, width, height)
+                            }
+
+                            encoder.queueInputBuffer(
+                                inIndex,
+                                0,
+                                byteSize,
+                                frameIndex * frameDurationUs,
+                                0
+                            )
+                            frameIndex++
+                        }
+                    }
                 }
-                while (true) {
-                    val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
-                    if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        if (!endOfStream) break
-                    } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+
+                val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
+                when {
+                    outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         if (!muxerStarted) {
-                            trackIndex = muxer!!.addTrack(encoder.outputFormat)
+                            trackIndex = muxer.addTrack(encoder.outputFormat)
                             muxer.start()
                             muxerStarted = true
                         }
-                    } else if (outIndex >= 0) {
+                    }
+                    outIndex >= 0 -> {
                         val encodedData = encoder.getOutputBuffer(outIndex)
-                        if (encodedData != null && bufferInfo.size > 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && muxerStarted) {
+                        if (encodedData != null &&
+                            bufferInfo.size > 0 &&
+                            (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+                        ) {
+                            if (!muxerStarted) {
+                                trackIndex = muxer.addTrack(encoder.outputFormat)
+                                muxer.start()
+                                muxerStarted = true
+                            }
                             encodedData.position(bufferInfo.offset)
                             encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer!!.writeSampleData(trackIndex, encodedData, bufferInfo)
+                            muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
+                            samplesWritten++
                         }
                         encoder.releaseOutputBuffer(outIndex, false)
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            break
+                            outputDone = true
                         }
                     }
                 }
             }
 
-            for (i in 0 until frameCount) {
-                val canvas: Canvas = inputSurface.lockCanvas(null)
-                drawTestFrame(canvas, width, height, i, frameCount, paint, rng)
-                inputSurface.unlockCanvasAndPost(canvas)
-                drainEncoder(false)
+            if (!muxerStarted || samplesWritten == 0) {
+                throw IllegalStateException("Demo video encoder produced no frames.")
             }
-            drainEncoder(true)
-            inputSurface.release()
+        } catch (e: Exception) {
+            if (outFile.exists()) outFile.delete()
+            throw e
         } finally {
+            frameBitmap.recycle()
             try {
                 encoder.stop()
             } catch (_: Exception) {
@@ -107,13 +171,94 @@ object TestClipGenerator {
             } catch (_: Exception) {
             }
             try {
-                if (muxerStarted) muxer?.stop()
+                if (muxerStarted && samplesWritten > 0) {
+                    muxer?.stop()
+                }
+            } catch (_: Exception) {
+            }
+            try {
                 muxer?.release()
             } catch (_: Exception) {
             }
         }
 
         Uri.fromFile(outFile)
+    }
+
+    private fun fillYuvImageFromArgb(image: Image, argb: IntArray, width: Int, height: Int) {
+        val planes = image.planes
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+
+        val yBuf = yPlane.buffer
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        val uRowStride = uPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vRowStride = vPlane.rowStride
+        val vPixelStride = vPlane.pixelStride
+
+        for (y in 0 until height) {
+            val yRowOffset = y * yRowStride
+            val uvRow = y shr 1
+            val uRowOffset = uvRow * uRowStride
+            val vRowOffset = uvRow * vRowStride
+            val rowStart = y * width
+
+            for (x in 0 until width) {
+                val c = argb[rowStart + x]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+
+                val yVal = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).coerceIn(0, 255)
+                yBuf.put(yRowOffset + x * yPixelStride, yVal.toByte())
+
+                if ((y and 1) == 0 && (x and 1) == 0) {
+                    val uvCol = x shr 1
+                    val uVal = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                    val vVal = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                    uBuf.put(uRowOffset + uvCol * uPixelStride, uVal.toByte())
+                    vBuf.put(vRowOffset + uvCol * vPixelStride, vVal.toByte())
+                }
+            }
+        }
+    }
+
+    private fun fillI420BufferFromArgb(buffer: ByteBuffer, argb: IntArray, width: Int, height: Int): Int {
+        buffer.clear()
+        val frameSize = width * height
+        val ySize = frameSize
+        val uvSize = frameSize / 4
+
+        var yIdx = 0
+        var uIdx = ySize
+        var vIdx = ySize + uvSize
+
+        for (y in 0 until height) {
+            val rowStart = y * width
+            for (x in 0 until width) {
+                val c = argb[rowStart + x]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+
+                val yVal = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).coerceIn(0, 255)
+                buffer.put(yIdx++, yVal.toByte())
+
+                if ((y and 1) == 0 && (x and 1) == 0) {
+                    val uVal = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                    val vVal = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                    buffer.put(uIdx++, uVal.toByte())
+                    buffer.put(vIdx++, vVal.toByte())
+                }
+            }
+        }
+        return ySize + uvSize * 2
     }
 
     private fun drawTestFrame(
